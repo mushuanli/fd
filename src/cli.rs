@@ -640,6 +640,9 @@ pub struct Opts {
     /// --search-path <path2> [<pattern>]`
     #[arg(
         long,
+        short = 'R',
+        visible_alias = "base",
+        num_args(1..),
         conflicts_with("path"),
         value_name = "search-path",
         hide_short_help = true,
