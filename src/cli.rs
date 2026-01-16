@@ -18,6 +18,21 @@ use crate::filesystem;
 use crate::filter::OwnerFilter;
 use crate::filter::SizeFilter;
 
+/// Represents the search paths, separating directories from files
+#[derive(Debug, Default, Clone)]
+pub struct SearchPaths {
+    /// Directories to traverse recursively
+    pub directories: Vec<PathBuf>,
+    /// Individual files to include directly
+    pub files: Vec<PathBuf>,
+}
+
+impl SearchPaths {
+    pub fn is_empty(&self) -> bool {
+        self.directories.is_empty() && self.files.is_empty()
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "fd",
@@ -636,7 +651,9 @@ pub struct Opts {
     path: Vec<PathBuf>,
 
     /// Provide paths to search as an alternative to the positional <path>
-    /// argument. Changes the usage to `fd [OPTIONS] --search-path <path>
+    /// argument. Can specify both directories (traversed recursively) and
+    /// files (included directly if they match the pattern).
+    /// Changes the usage to `fd [OPTIONS] --search-path <path>
     /// --search-path <path2> [<pattern>]`
     #[arg(
         long,
@@ -646,10 +663,34 @@ pub struct Opts {
         conflicts_with("path"),
         value_name = "search-path",
         hide_short_help = true,
-        help = "Provides paths to search as an alternative to the positional <path> argument",
+        help = "Provide paths to search (directories or files)",
+        long_help = "Provide paths to search as an alternative to the positional <path> \
+                     argument. Can specify both directories (which are traversed recursively) \
+                     and files (which are included directly if they match the search pattern). \
+                     Changes the usage to `fd [OPTIONS] --search-path <path> \
+                     --search-path <path2> [<pattern>]`"
+    )]
+    pub search_path: Vec<PathBuf>,
+
+    /// Exclude specific paths (files or directories) from the search results.
+    /// This is the inverse of --search-path/-R. Paths specified here will be
+    /// excluded from results even if they match the search pattern.
+    /// When a directory is excluded, all of its contents are also excluded.
+    ///
+    /// Examples:
+    /// {n}  --exclude-path ./node_modules
+    /// {n}  -N ./target -N ./build
+    /// {n}  -N ./specific-file.txt
+    #[arg(
+        long = "exclude-path",
+        short = 'N',
+        visible_alias = "not-path",
+        value_name = "path",
+        hide_short_help = true,
+        help = "Exclude specific paths (files or directories) from search results",
         long_help
     )]
-    search_path: Vec<PathBuf>,
+    pub exclude_path: Vec<PathBuf>,
 
     /// By default, relative paths are prefixed with './' when -x/--exec,
     /// -X/--exec-batch, or -0/--print0 are given, to reduce the risk of a
@@ -673,8 +714,8 @@ pub struct Opts {
 }
 
 impl Opts {
-    pub fn search_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
-        // would it make sense to concatenate these?
+    pub fn search_paths(&self) -> anyhow::Result<SearchPaths> {
+        // Determine which paths to use
         let paths = if !self.path.is_empty() {
             &self.path
         } else if !self.search_path.is_empty() {
@@ -682,22 +723,49 @@ impl Opts {
         } else {
             let current_directory = Path::new("./");
             ensure_current_directory_exists(current_directory)?;
-            return Ok(vec![self.normalize_path(current_directory)]);
+            return Ok(SearchPaths {
+                directories: vec![self.normalize_path(current_directory)],
+                files: vec![],
+            });
         };
-        Ok(paths
+
+        let mut result = SearchPaths::default();
+        
+        for path in paths {
+            if filesystem::is_existing_directory(path) {
+                result.directories.push(self.normalize_path(path));
+            } else if path.is_file() {
+                result.files.push(self.normalize_path(path));
+            } else if path.symlink_metadata().is_ok() {
+                // Handle symlinks and other special files
+                result.files.push(self.normalize_path(path));
+            } else {
+                print_error(format!(
+                    "Search path '{}' is not a valid file or directory.",
+                    path.to_string_lossy()
+                ));
+            }
+        }
+        
+        Ok(result)
+    }
+
+    /// Get normalized excluded paths, filtering out non-existent ones with warnings
+    pub fn excluded_paths(&self) -> Vec<PathBuf> {
+        self.exclude_path
             .iter()
             .filter_map(|path| {
-                if filesystem::is_existing_directory(path) {
+                if path.exists() || path.symlink_metadata().is_ok() {
                     Some(self.normalize_path(path))
                 } else {
                     print_error(format!(
-                        "Search path '{}' is not a directory.",
+                        "Exclude path '{}' does not exist, ignoring.",
                         path.to_string_lossy()
                     ));
                     None
                 }
             })
-            .collect())
+            .collect()
     }
 
     fn normalize_path(&self, path: &Path) -> PathBuf {

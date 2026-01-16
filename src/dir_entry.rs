@@ -12,6 +12,7 @@ use crate::filesystem::strip_current_dir;
 enum DirEntryInner {
     Normal(ignore::DirEntry),
     BrokenSymlink(PathBuf),
+    DirectFile(PathBuf),  // 新增：直接指定的文件
 }
 
 #[derive(Debug)]
@@ -39,10 +40,19 @@ impl DirEntry {
         }
     }
 
+    pub fn direct_file(path: PathBuf) -> Self {
+        Self {
+            inner: DirEntryInner::DirectFile(path),
+            metadata: OnceCell::new(),
+            style: OnceCell::new(),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         match &self.inner {
             DirEntryInner::Normal(e) => e.path(),
             DirEntryInner::BrokenSymlink(pathbuf) => pathbuf.as_path(),
+            DirEntryInner::DirectFile(pathbuf) => pathbuf.as_path(),
         }
     }
 
@@ -50,6 +60,7 @@ impl DirEntry {
         match self.inner {
             DirEntryInner::Normal(e) => e.into_path(),
             DirEntryInner::BrokenSymlink(p) => p,
+            DirEntryInner::DirectFile(p) => p,
         }
     }
 
@@ -75,6 +86,7 @@ impl DirEntry {
         match &self.inner {
             DirEntryInner::Normal(e) => e.file_type(),
             DirEntryInner::BrokenSymlink(_) => self.metadata().map(|m| m.file_type()),
+            DirEntryInner::DirectFile(_) => self.metadata().map(|m| m.file_type()),
         }
     }
 
@@ -83,6 +95,7 @@ impl DirEntry {
             .get_or_init(|| match &self.inner {
                 DirEntryInner::Normal(e) => e.metadata().ok(),
                 DirEntryInner::BrokenSymlink(path) => path.symlink_metadata().ok(),
+                DirEntryInner::DirectFile(path) => path.metadata().ok(),  // 新增
             })
             .as_ref()
     }
@@ -91,6 +104,7 @@ impl DirEntry {
         match &self.inner {
             DirEntryInner::Normal(e) => Some(e.depth()),
             DirEntryInner::BrokenSymlink(_) => None,
+            DirEntryInner::DirectFile(_) => Some(0), // 直接文件视为深度0
         }
     }
 
@@ -136,6 +150,13 @@ impl Colorable for DirEntry {
                 // Path::file_name() only works if the last component is Normal,
                 // but we want it for all component types, so we open code it.
                 // Copied from LsColors::style_for_path_with_metadata().
+                path.components()
+                    .next_back()
+                    .map(|c| c.as_os_str())
+                    .unwrap_or_else(|| path.as_os_str())
+            }
+            // 新增: DirectFile 使用相同逻辑
+            DirEntryInner::DirectFile(path) => {
                 path.components()
                     .next_back()
                     .map(|c| c.as_os_str())

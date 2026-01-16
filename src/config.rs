@@ -130,6 +130,9 @@ pub struct Config {
 
     /// Whether or not to use hyperlinks on paths
     pub hyperlink: bool,
+
+    /// Paths (files or directories) to exclude from search results
+    pub excluded_paths: Vec<PathBuf>,
 }
 
 impl Config {

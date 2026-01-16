@@ -81,7 +81,7 @@ fn run() -> Result<ExitCode> {
 
     set_working_dir(&opts)?;
     let search_paths = opts.search_paths()?;
-    if search_paths.is_empty() {
+    if search_paths.directories.is_empty() && search_paths.files.is_empty() {
         bail!("No valid search paths given.");
     }
 
@@ -326,6 +326,7 @@ fn construct_config(mut opts: Opts, pattern_regexps: &[String]) -> Result<Config
         actual_path_separator,
         max_results: opts.max_results(),
         strip_cwd_prefix: opts.strip_cwd_prefix(|| !(opts.null_separator || has_command)),
+        excluded_paths: opts.excluded_paths(),
     })
 }
 

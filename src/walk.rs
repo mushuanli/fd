@@ -7,8 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::path::Path;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow,bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender, bounded};
 use etcetera::BaseStrategy;
 use ignore::overrides::{Override, OverrideBuilder};
@@ -22,6 +24,7 @@ use crate::exec;
 use crate::exit_codes::{ExitCode, merge_exitcodes};
 use crate::filesystem;
 use crate::output;
+use crate::cli::SearchPaths;
 
 /// The receiver thread can either be buffering results or directly streaming to the console.
 #[derive(PartialEq)]
@@ -312,18 +315,25 @@ struct WorkerState {
     quit_flag: Arc<AtomicBool>,
     /// Flag specifically for quitting due to ^C
     interrupt_flag: Arc<AtomicBool>,
+    /// Set of excluded paths for efficient lookup
+    excluded_paths: HashSet<PathBuf>,
+    /// Direct files to include (from -R with file arguments)
+    direct_files: Vec<PathBuf>,
 }
 
 impl WorkerState {
-    fn new(patterns: Vec<Regex>, config: Config) -> Self {
+    fn new(patterns: Vec<Regex>, config: Config, direct_files: Vec<PathBuf>) -> Self {
         let quit_flag = Arc::new(AtomicBool::new(false));
         let interrupt_flag = Arc::new(AtomicBool::new(false));
+        let excluded_paths: HashSet<PathBuf> = config.excluded_paths.iter().cloned().collect();
 
         Self {
             patterns,
             config,
             quit_flag,
             interrupt_flag,
+            excluded_paths,
+            direct_files,
         }
     }
 
@@ -345,6 +355,12 @@ impl WorkerState {
     }
 
     fn build_walker(&self, paths: &[PathBuf]) -> Result<WalkParallel> {
+        if paths.is_empty() {
+            // Return a no-op walker if no directories
+            // This case will be handled separately
+            bail!("No directories to walk");
+        }
+        
         let first_path = &paths[0];
         let config = &self.config;
         let overrides = self.build_overrides(paths)?;
@@ -403,6 +419,64 @@ impl WorkerState {
         Ok(walker)
     }
 
+    /// Process direct files that were specified via -R
+    fn process_direct_files(&self, tx: &Sender<Batch>) {
+        let config = &self.config;
+        let patterns = &self.patterns;
+        
+        for file_path in &self.direct_files {
+            // Check if excluded
+            if is_path_excluded(file_path, &self.excluded_paths) {
+                continue;
+            }
+
+            // Check pattern matching
+            let search_str: Cow<OsStr> = if config.search_full_path {
+                match filesystem::path_absolute_form(file_path) {
+                    Ok(abs_path) => Cow::Owned(abs_path.as_os_str().to_os_string()),
+                    Err(_) => continue,
+                }
+            } else {
+                match file_path.file_name() {
+                    Some(filename) => Cow::Borrowed(filename),
+                    None => continue,
+                }
+            };
+
+            if !patterns
+                .iter()
+                .all(|pat| pat.is_match(&filesystem::osstr_to_bytes(search_str.as_ref())))
+            {
+                continue;
+            }
+
+            // Create DirEntry for the file
+            // We need to handle this specially since it's not from the walker
+            if let Ok(metadata) = file_path.symlink_metadata() {
+                let entry = if metadata.file_type().is_symlink() && file_path.metadata().is_err() {
+                    DirEntry::broken_symlink(file_path.clone())
+                } else {
+                    DirEntry::direct_file(file_path.clone())
+                };
+
+                // Apply filters (similar to spawn_senders logic)
+                if let Some(ref file_types) = config.file_types {
+                    if file_types.should_ignore(&entry) {
+                        continue;
+                    }
+                }
+
+                // Send the entry
+                let batch = Batch::new();
+                {
+                    let mut items = batch.lock();
+                    items.as_mut().unwrap().push(WorkerResult::Entry(entry));
+                }
+                let _ = tx.send(batch);
+            }
+        }
+    }
+
     /// Run the receiver work, either on this thread or a pool of background
     /// threads (for --exec).
     fn receive(&self, rx: Receiver<Batch>) -> ExitCode {
@@ -441,10 +515,13 @@ impl WorkerState {
 
     /// Spawn the sender threads.
     fn spawn_senders(&self, walker: WalkParallel, tx: Sender<Batch>) {
+        let excluded_paths = self.excluded_paths.clone();
+        
         walker.run(|| {
             let patterns = &self.patterns;
             let config = &self.config;
             let quit_flag = self.quit_flag.as_ref();
+            let excluded_paths = excluded_paths.clone();
 
             let mut limit = 0x100;
             if let Some(cmd) = &config.command
@@ -498,14 +575,22 @@ impl WorkerState {
                     }
                 };
 
+                // Check exclusion early
+                let entry_path = entry.path();
+                if is_path_excluded(entry_path, &excluded_paths) {
+                    // If it's a directory, skip its contents too
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        return WalkState::Skip;
+                    }
+                    return WalkState::Continue;
+                }
+
                 if let Some(min_depth) = config.min_depth
                     && entry.depth().is_none_or(|d| d < min_depth)
                 {
                     return WalkState::Continue;
                 }
 
-                // Check the name first, since it doesn't require metadata
-                let entry_path = entry.path();
 
                 let search_str: Cow<OsStr> = if config.search_full_path {
                     let path_abs_buf = filesystem::path_absolute_form(entry_path)
@@ -620,10 +705,10 @@ impl WorkerState {
     }
 
     /// Perform the recursive scan.
-    fn scan(&self, paths: &[PathBuf]) -> Result<ExitCode> {
+    fn scan(&self, directories: &[PathBuf]) -> Result<ExitCode> {
         let config = &self.config;
-        let walker = self.build_walker(paths)?;
-
+        
+        // Set up Ctrl+C handler
         if config.ls_colors.is_some() && config.is_printing() {
             let quit_flag = Arc::clone(&self.quit_flag);
             let interrupt_flag = Arc::clone(&self.interrupt_flag);
@@ -645,8 +730,28 @@ impl WorkerState {
             // Spawn the receiver thread(s)
             let receiver = scope.spawn(|| self.receive(rx));
 
-            // Spawn the sender threads.
-            self.spawn_senders(walker, tx);
+            // Process direct files first (files specified via -R)
+            if !self.direct_files.is_empty() {
+                self.process_direct_files(&tx);
+            }
+
+            // Spawn the sender threads for directory traversal
+            if !directories.is_empty() {
+                match self.build_walker(directories) {
+                    Ok(walker) => {
+                        self.spawn_senders(walker, tx);
+                    }
+                    Err(e) => {
+                        // Log error but don't fail if we have direct files
+                        if self.direct_files.is_empty() {
+                            print_error(format!("Failed to build walker: {}", e));
+                        }
+                        drop(tx); // Ensure channel is closed
+                    }
+                }
+            } else {
+                drop(tx); // No directories, close the channel
+            }
 
             receiver.join().unwrap()
         });
@@ -659,11 +764,35 @@ impl WorkerState {
     }
 }
 
+// Helper function outside WorkerState for use in closures
+fn is_path_excluded(path: &Path, excluded_paths: &HashSet<PathBuf>) -> bool {
+    // Normalize the path for comparison
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    
+    // Check exact match
+    if excluded_paths.iter().any(|excluded| {
+        excluded.canonicalize().unwrap_or_else(|_| excluded.clone()) == path
+    }) {
+        return true;
+    }
+    
+    // Check if path is under any excluded directory
+    for excluded in excluded_paths {
+        let excluded_canonical = excluded.canonicalize().unwrap_or_else(|_| excluded.clone());
+        if path.starts_with(&excluded_canonical) {
+            return true;
+        }
+    }
+    
+    false
+}
+
 /// Recursively scan the given search path for files / pathnames matching the patterns.
 ///
 /// If the `--exec` argument was supplied, this will create a thread pool for executing
 /// jobs in parallel from a given command line and the discovered paths. Otherwise, each
 /// path will simply be written to standard output.
-pub fn scan(paths: &[PathBuf], patterns: Vec<Regex>, config: Config) -> Result<ExitCode> {
-    WorkerState::new(patterns, config).scan(paths)
+pub fn scan(search_paths: &SearchPaths, patterns: Vec<Regex>, config: Config) -> Result<ExitCode> {
+    WorkerState::new(patterns, config, search_paths.files.clone())
+        .scan(&search_paths.directories)
 }
