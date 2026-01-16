@@ -1,5 +1,6 @@
 use std::io;
 use std::io::Write;
+use std::path::Path;
 
 use argmax::Command;
 
@@ -54,6 +55,13 @@ impl OutputBuffer {
             let _ = stdout.write_all(b"\0");
         }
     }
+}
+
+/// 打印执行头信息
+pub fn print_exec_header(cmd: &Command, path: &Path) {
+    let cmd_name = cmd.get_program().to_string_lossy();
+    let path_str = path.to_string_lossy();
+    eprintln!("\n==={} {}===", cmd_name, path_str);
 }
 
 /// Executes a command.

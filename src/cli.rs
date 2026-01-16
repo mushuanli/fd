@@ -28,6 +28,7 @@ pub struct SearchPaths {
 }
 
 impl SearchPaths {
+#[allow(unused)]
     pub fn is_empty(&self) -> bool {
         self.directories.is_empty() && self.files.is_empty()
     }
@@ -484,6 +485,20 @@ pub struct Opts {
 
     #[command(flatten)]
     pub exec: Exec,
+
+    /// Print a header before executing each command showing the file path.
+    /// When used with -x/--exec, displays "==={cmd} {path}===" before each execution.
+    #[arg(
+        long = "print-exec-header",
+        visible_alias = "exec-header",
+        hide_short_help = true,
+        help = "Print file info header before each --exec command",
+        long_help = "When used with -x/--exec, prints a header line before each command execution \
+                     showing the command and file path in the format:\n\n  \
+                     ==={cmd} {path}===\n\n\
+                     This is useful for identifying which file each command output belongs to."
+    )]
+    pub print_exec_header: bool,
 
     /// Maximum number of arguments to pass to the command given with -X.
     /// If the number of results is greater than the given size,

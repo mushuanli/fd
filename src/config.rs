@@ -133,6 +133,9 @@ pub struct Config {
 
     /// Paths (files or directories) to exclude from search results
     pub excluded_paths: Vec<PathBuf>,
+
+    /// Whether to print a header before each exec command
+    pub print_exec_header: bool,
 }
 
 impl Config {

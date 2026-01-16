@@ -82,12 +82,21 @@ impl CommandSet {
         path_separator: Option<&str>,
         null_separator: bool,
         buffer_output: bool,
+        print_header: bool,  // 新增参数
     ) -> ExitCode {
-        let commands = self
+        let commands: Vec<_> = self
             .commands
             .iter()
-            .map(|c| c.generate(input, path_separator));
-        execute_commands(commands, OutputBuffer::new(null_separator), buffer_output)
+            .map(|c| c.generate(input, path_separator))
+            .collect();
+        
+        if print_header && !commands.is_empty() {
+            if let Ok(ref cmd) = commands[0] {
+                command::print_exec_header(cmd, input);
+            }
+        }
+        
+        execute_commands(commands.into_iter(), OutputBuffer::new(null_separator), buffer_output)
     }
 
     pub fn execute_batch<I>(&self, paths: I, limit: usize, path_separator: Option<&str>) -> ExitCode

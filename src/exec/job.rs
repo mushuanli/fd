@@ -36,6 +36,7 @@ pub fn job(
             config.path_separator.as_deref(),
             config.null_separator,
             buffer_output,
+            config.print_exec_header,  // 新增
         );
         ret = merge_exitcodes([ret, code]);
     }
