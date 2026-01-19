@@ -8,6 +8,7 @@ use crate::error::print_error;
 use crate::exit_codes::ExitCode;
 
 struct Outputs {
+    header: Option<String>,  // 新增：存储 header
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -24,8 +25,8 @@ impl OutputBuffer {
         }
     }
 
-    fn push(&mut self, stdout: Vec<u8>, stderr: Vec<u8>) {
-        self.outputs.push(Outputs { stdout, stderr });
+    fn push(&mut self, header: Option<String>, stdout: Vec<u8>, stderr: Vec<u8>) {
+        self.outputs.push(Outputs { header, stdout, stderr });
     }
 
     fn write(self) {
@@ -46,6 +47,10 @@ impl OutputBuffer {
         let mut stderr = stderr.lock();
 
         for output in self.outputs.iter() {
+            // 先输出 header
+            if let Some(ref header) = output.header {
+                let _ = writeln!(stdout, "{}", header);
+            }
             let _ = stdout.write_all(&output.stdout);
             let _ = stderr.write_all(&output.stderr);
         }
@@ -57,11 +62,11 @@ impl OutputBuffer {
     }
 }
 
-/// 打印执行头信息
-pub fn print_exec_header(cmd: &Command, path: &Path) {
+/// 生成执行头信息字符串
+pub fn format_exec_header(cmd: &Command, path: &Path) -> String {
     let cmd_name = cmd.get_program().to_string_lossy();
     let path_str = path.to_string_lossy();
-    eprintln!("\n==={} {}===", cmd_name, path_str);
+    format!("\n==={} {}===", cmd_name, path_str)
 }
 
 /// Executes a command.
@@ -69,7 +74,10 @@ pub fn execute_commands<I: Iterator<Item = io::Result<Command>>>(
     cmds: I,
     mut output_buffer: OutputBuffer,
     enable_output_buffering: bool,
+    header: Option<String>,  // 新增参数
 ) -> ExitCode {
+    let mut first = true;
+    
     for result in cmds {
         let mut cmd = match result {
             Ok(cmd) => cmd,
@@ -82,6 +90,18 @@ pub fn execute_commands<I: Iterator<Item = io::Result<Command>>>(
         } else {
             // If running on only one thread, don't buffer output
             // Allows for viewing and interacting with intermediate command output
+            
+            // 非缓冲模式下，直接打印 header
+            if first {
+                if let Some(ref h) = header {
+                    let stdout = io::stdout();
+                    let mut handle = stdout.lock();
+                    let _ = writeln!(handle, "{}", h);
+                    let _ = handle.flush();
+                }
+                first = false;
+            }
+            
             cmd.spawn().and_then(|c| c.wait_with_output())
         };
 
@@ -89,7 +109,14 @@ pub fn execute_commands<I: Iterator<Item = io::Result<Command>>>(
         match output {
             Ok(output) => {
                 if enable_output_buffering {
-                    output_buffer.push(output.stdout, output.stderr);
+                    // 缓冲模式下，将 header 与输出一起存储
+                    let h = if first {
+                        first = false;
+                        header.clone()
+                    } else {
+                        None
+                    };
+                    output_buffer.push(h, output.stdout, output.stderr);
                 }
                 if output.status.code() != Some(0) {
                     output_buffer.write();

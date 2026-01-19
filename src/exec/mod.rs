@@ -14,7 +14,7 @@ use crate::exec::command::OutputBuffer;
 use crate::exit_codes::{ExitCode, merge_exitcodes};
 use crate::fmt::{FormatTemplate, Token};
 
-use self::command::{execute_commands, handle_cmd_error};
+use self::command::{execute_commands, format_exec_header, handle_cmd_error};
 pub use self::job::{batch, job};
 
 /// Execution mode of the command
@@ -82,7 +82,7 @@ impl CommandSet {
         path_separator: Option<&str>,
         null_separator: bool,
         buffer_output: bool,
-        print_header: bool,  // 新增参数
+        print_header: bool,
     ) -> ExitCode {
         let commands: Vec<_> = self
             .commands
@@ -90,13 +90,21 @@ impl CommandSet {
             .map(|c| c.generate(input, path_separator))
             .collect();
         
-        if print_header && !commands.is_empty() {
-            if let Ok(ref cmd) = commands[0] {
-                command::print_exec_header(cmd, input);
-            }
-        }
+        // 生成 header 字符串（如果需要）
+        let header = if print_header && !commands.is_empty() {
+            commands.first()
+                .and_then(|r| r.as_ref().ok())
+                .map(|cmd| format_exec_header(cmd, input))
+        } else {
+            None
+        };
         
-        execute_commands(commands.into_iter(), OutputBuffer::new(null_separator), buffer_output)
+        execute_commands(
+            commands.into_iter(),
+            OutputBuffer::new(null_separator),
+            buffer_output,
+            header,
+        )
     }
 
     pub fn execute_batch<I>(&self, paths: I, limit: usize, path_separator: Option<&str>) -> ExitCode
